@@ -1136,3 +1136,10 @@ https://groups.google.com/forum/?fromgroups=#!forum/turn-server-project-rfc5766-
   AUTHORS
 
 	See the AUTHORS.md file in the coturn source distribution.
+
+Capacity metrics: --prometheus-observe-realm=NAME selects up to 16 exact realms
+(repeatable; default: the server's default realm). New bounded quota, ALLOCATE
+result, lifecycle, activity and producer-freshness metrics use the existing
+Prometheus endpoint. Both HTTP and HTTPS exporters limit concurrent connections
+to eight and idle time to ten seconds. See docs/Prometheus.md for semantics,
+coverage and PromQL, including missing data, unlimited quota and stale snapshots.

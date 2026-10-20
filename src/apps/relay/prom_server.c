@@ -37,6 +37,7 @@
 #include "ns_turn_atomic.h" // for TURN_THREAD_LOCAL (portable thread-local on MSVC)
 #include "ns_turn_ratelimit.h"
 #include "ns_turn_utils.h"
+#include <pthread.h>
 #include <stdio.h>
 #if !defined(WINDOWS)
 #include <errno.h>
@@ -113,6 +114,103 @@ static void prom_refresh_ratelimit_stats(void) {
   prom_gauge_set(turn_ratelimit_occupied_buckets, (double)ratelimit_count_occupied(), NULL);
 }
 
+static prom_counter_t *turn_observe_results_metric;
+static prom_counter_t *turn_observe_created_metric;
+static prom_counter_t *turn_observe_closed_metric;
+static prom_gauge_t *turn_observe_activity_metric;
+static prom_gauge_t *turn_observe_used_metric;
+static prom_gauge_t *turn_observe_limit_metric;
+static prom_gauge_t *turn_observe_timestamp_metric;
+static turn_observe_snapshot turn_observe_last_export;
+static pthread_mutex_t turn_observe_render_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char *turn_observe_codes[16] = {"success", "300", "400", "403", "420", "437", "440", "441",
+                                             "442",     "443", "486", "486", "486", "486", "508", "other"};
+static const char *turn_observe_causes[16] = {
+    "none",  "other", "other",       "other",      "other",           "other", "other",    "other",
+    "other", "other", "total_quota", "user_quota", "bandwidth_quota", "other", "capacity", "other"};
+static const char *turn_observe_reasons[3] = {"client_delete", "expired", "other"};
+static const char *turn_observe_activities[3] = {"new", "quiet", "recent"};
+static const char *turn_observe_bytes[3] = {"zero", "le_64k", "gt_64k"};
+
+static void turn_observe_metrics_refresh(bool initialize) {
+  turn_observe_snapshot snapshot = {0};
+  turn_observe_collect(&snapshot);
+  for (size_t r = 0; r < turn_observe_realm_count(); ++r) {
+    const char *realm = turn_observe_realm_name(r);
+    const char *labels[] = {realm, NULL, NULL};
+    for (size_t i = 0; i < TURN_OBSERVE_RESULTS; ++i) {
+      labels[1] = turn_observe_codes[i];
+      labels[2] = turn_observe_causes[i];
+      if (initialize || snapshot.realm[r].results[i] != turn_observe_last_export.realm[r].results[i]) {
+        prom_counter_add(turn_observe_results_metric,
+                         (double)(snapshot.realm[r].results[i] - turn_observe_last_export.realm[r].results[i]), labels);
+      }
+    }
+    if (initialize || snapshot.realm[r].created != turn_observe_last_export.realm[r].created) {
+      prom_counter_add(turn_observe_created_metric,
+                       (double)(snapshot.realm[r].created - turn_observe_last_export.realm[r].created), labels);
+    }
+    for (size_t i = 0; i < 3; ++i) {
+      labels[1] = turn_observe_reasons[i];
+      if (initialize || snapshot.realm[r].closed[i] != turn_observe_last_export.realm[r].closed[i]) {
+        prom_counter_add(turn_observe_closed_metric,
+                         (double)(snapshot.realm[r].closed[i] - turn_observe_last_export.realm[r].closed[i]), labels);
+      }
+    }
+    for (size_t i = 0; i < TURN_OBSERVE_BINS; ++i) {
+      labels[1] = turn_observe_activities[i / 3];
+      labels[2] = turn_observe_bytes[i % 3];
+      if (initialize || snapshot.realm[r].bins[i] != turn_observe_last_export.realm[r].bins[i]) {
+        prom_gauge_set(turn_observe_activity_metric, (double)snapshot.realm[r].bins[i], labels);
+      }
+    }
+    if (snapshot.quota[r].known) {
+      prom_gauge_set(turn_observe_used_metric, (double)snapshot.quota[r].used, labels);
+      labels[1] = "total";
+      prom_gauge_set(turn_observe_limit_metric, (double)snapshot.quota[r].total, labels);
+      labels[1] = "user";
+      prom_gauge_set(turn_observe_limit_metric, (double)snapshot.quota[r].user, labels);
+    }
+  }
+  prom_gauge_set(turn_observe_timestamp_metric, (double)snapshot.timestamp, NULL);
+  turn_observe_last_export = snapshot;
+}
+
+static void turn_observe_metrics_init(void) {
+  const char *realm[] = {"realm"};
+  const char *scope[] = {"realm", "scope"};
+  const char *result[] = {"realm", "code", "cause"};
+  const char *reason[] = {"realm", "reason"};
+  const char *activity[] = {"realm", "activity", "peer_bytes"};
+  turn_observe_used_metric = prom_collector_registry_must_register_metric(
+      prom_gauge_new("turn_quota_used", "Acquired allocation quota units", 1, realm));
+  turn_observe_limit_metric = prom_collector_registry_must_register_metric(
+      prom_gauge_new("turn_quota_limit", "Effective quota limit; zero means unlimited", 2, scope));
+  turn_observe_results_metric = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_allocate_results_total",
+                       "Final ALLOCATE responses prepared for transmission, excluding 401 and 438", 3, result));
+  turn_observe_created_metric = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_allocations_created_total", "Logical allocations created", 1, realm));
+  turn_observe_closed_metric = prom_collector_registry_must_register_metric(
+      prom_counter_new("turn_allocations_closed_total", "Logical allocations finally closed", 2, reason));
+  turn_observe_activity_metric = prom_collector_registry_must_register_metric(
+      prom_gauge_new("turn_allocations_by_activity",
+                     "Live logical allocations by age, last data activity and accepted payload bytes", 3, activity));
+  turn_observe_timestamp_metric = prom_collector_registry_must_register_metric(
+      prom_gauge_new("turn_observability_snapshot_timestamp_seconds",
+                     "Oldest necessary producer snapshot Unix time; zero means not ready", 0, NULL));
+  turn_observe_metrics_refresh(true);
+}
+
+static char *turn_prometheus_bridge(void) {
+  pthread_mutex_lock(&turn_observe_render_lock);
+  prom_refresh_ratelimit_stats();
+  turn_observe_metrics_refresh(false);
+  char *body = prom_collector_registry_bridge(PROM_COLLECTOR_REGISTRY_DEFAULT);
+  pthread_mutex_unlock(&turn_observe_render_lock);
+  return body;
+}
+
 static MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection, const char *url, const char *method,
                                    const char *version, const char *upload_data, size_t *upload_data_size,
                                    void **con_cls) {
@@ -131,8 +229,7 @@ static MHD_RESULT promhttp_handler(void *cls, struct MHD_Connection *connection,
     status = MHD_HTTP_METHOD_NOT_ALLOWED;
     body = "method not allowed";
   } else if (strcmp(url, turn_params.prometheus_path) == 0) {
-    prom_refresh_ratelimit_stats();
-    body = (char *)prom_collector_registry_bridge(PROM_COLLECTOR_REGISTRY_DEFAULT);
+    body = turn_prometheus_bridge();
     if (body == NULL) {
       return MHD_NO;
     }
@@ -191,6 +288,7 @@ void start_prometheus_server(void) {
     return;
   }
   prom_collector_registry_default_init();
+  turn_observe_metrics_init();
 
   const char *label[] = {"realm", NULL};
   size_t nlabels = 1;
@@ -385,11 +483,13 @@ void start_prometheus_server(void) {
   struct MHD_Daemon *daemon;
   if (turn_params.prometheus_tls) {
     daemon = MHD_start_daemon(flags, 0, NULL, NULL, &promhttp_handler, NULL, MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                              MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_HTTPS_MEM_CERT, https_cert,
-                              MHD_OPTION_HTTPS_MEM_KEY, https_key, MHD_OPTION_END);
+                              MHD_OPTION_CONNECTION_LIMIT, (unsigned int)8, MHD_OPTION_CONNECTION_TIMEOUT,
+                              (unsigned int)10, MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_HTTPS_MEM_CERT,
+                              https_cert, MHD_OPTION_HTTPS_MEM_KEY, https_key, MHD_OPTION_END);
   } else {
     daemon = MHD_start_daemon(flags, 0, NULL, NULL, &promhttp_handler, NULL, MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                              MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_END);
+                              MHD_OPTION_CONNECTION_LIMIT, (unsigned int)8, MHD_OPTION_CONNECTION_TIMEOUT,
+                              (unsigned int)10, MHD_OPTION_SOCK_ADDR, &server_addr, MHD_OPTION_END);
   }
   if (daemon == NULL) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "could not start prometheus collector\n");

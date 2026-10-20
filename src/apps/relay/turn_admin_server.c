@@ -2107,14 +2107,23 @@ static void update_param(const char *pn, const char *value) {
       const turn_dbdriver_t *dbd = get_dbdriver();
       if (dbd && dbd->set_realm_option_one) {
         if (strstr(pn, "cr-total-quota") == pn) {
-          rp->options.perf_options.total_quota = atoi(value);
-          dbd->set_realm_option_one((uint8_t *)rp->options.name, rp->options.perf_options.total_quota, "total-quota");
+          const int limit = atoi(value);
+          lock_realms();
+          rp->options.perf_options.total_quota = limit;
+          unlock_realms();
+          dbd->set_realm_option_one((uint8_t *)rp->options.name, limit, "total-quota");
         } else if (strstr(pn, "cr-user-quota") == pn) {
-          rp->options.perf_options.user_quota = atoi(value);
-          dbd->set_realm_option_one((uint8_t *)rp->options.name, rp->options.perf_options.user_quota, "user-quota");
+          const int limit = atoi(value);
+          lock_realms();
+          rp->options.perf_options.user_quota = limit;
+          unlock_realms();
+          dbd->set_realm_option_one((uint8_t *)rp->options.name, limit, "user-quota");
         } else if (strstr(pn, "cr-max-bps") == pn) {
-          rp->options.perf_options.max_bps = (band_limit_t)strtoul(value, NULL, 10);
-          dbd->set_realm_option_one((uint8_t *)rp->options.name, rp->options.perf_options.max_bps, "max-bps");
+          const band_limit_t limit = (band_limit_t)strtoul(value, NULL, 10);
+          lock_realms();
+          rp->options.perf_options.max_bps = limit;
+          unlock_realms();
+          dbd->set_realm_option_one((uint8_t *)rp->options.name, limit, "max-bps");
         }
       }
     }

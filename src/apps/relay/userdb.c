@@ -677,7 +677,42 @@ uint8_t *start_user_check(turnserver_id id, turn_credential_type ct, int in_oaut
   return NULL;
 }
 
-int check_new_allocation_quota(uint8_t *user, int oauth, uint8_t *realm) {
+int turn_read_quota_snapshot(const char *name, turn_observe_quota *out) {
+  char key[STUN_MAX_REALM_SIZE + 1] = {0};
+  if (strlen(name) >= sizeof(key)) {
+    return 0;
+  }
+  strcpy(key, name);
+  if (!turn_ur_string_map_trylock(realms)) {
+    return -1;
+  }
+  ur_string_map_value_type value = 0;
+  realm_params_t *rp = NULL;
+  if (!strcmp(name, default_realm_params_ptr->options.name)) {
+    rp = default_realm_params_ptr;
+  } else if (ur_string_map_get(realms, key, &value)) {
+    rp = (realm_params_t *)value;
+  }
+  int result = 0;
+  if (rp) {
+    /* Both existing locks are try-only; never wait while holding either. */
+    if (turn_ur_string_map_trylock(rp->status.alloc_counters)) {
+      out->used = rp->status.total_current_allocs;
+      out->total = rp->options.perf_options.total_quota;
+      out->user = rp->options.perf_options.user_quota;
+      out->known = true;
+      ur_string_map_unlock(rp->status.alloc_counters);
+      result = 1;
+    } else {
+      result = -1;
+    }
+  }
+  ur_string_map_unlock(realms);
+  return result;
+}
+
+int check_new_allocation_quota(uint8_t *user, int oauth, uint8_t *realm, turn_quota_cause *cause) {
+  *cause = TURN_QUOTA_OTHER;
   int ret = 0;
   if (user || oauth) {
     uint8_t *username = oauth ? (uint8_t *)turn_strdup("") : (uint8_t *)get_real_username((char *)user);
@@ -692,6 +727,7 @@ int check_new_allocation_quota(uint8_t *user, int oauth, uint8_t *realm) {
     unlock_realms();
     ur_string_map_lock(rp->status.alloc_counters);
     if (total_quota && (rp->status.total_current_allocs >= total_quota)) {
+      *cause = TURN_QUOTA_TOTAL;
       ret = -1;
     } else if (username[0]) {
       ur_string_map_value_type value = 0;
@@ -701,6 +737,7 @@ int check_new_allocation_quota(uint8_t *user, int oauth, uint8_t *realm) {
         ++(rp->status.total_current_allocs);
       } else {
         if ((user_quota) && ((size_t)value >= (size_t)user_quota)) {
+          *cause = TURN_QUOTA_USER;
           ret = -1;
         } else {
           value = (ur_string_map_value_type)(((size_t)value) + 1);

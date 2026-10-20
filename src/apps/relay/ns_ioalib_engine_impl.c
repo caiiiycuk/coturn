@@ -404,7 +404,7 @@ static inline void add_elem_to_buffer_list(stun_buffer_list *bufs, stun_buffer_l
   bufs->tsz += 1;
 }
 
-static void add_buffer_to_buffer_list(stun_buffer_list *bufs, char *buf, size_t len) {
+static bool add_buffer_to_buffer_list(stun_buffer_list *bufs, char *buf, size_t len) {
   if (bufs && buf && (bufs->tsz < MAX_SOCKET_BUFFER_BACKLOG)) {
     stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)turn_malloc(sizeof(stun_buffer_list_elem));
     memcpy(buf_elem->buf.buf, buf, len);
@@ -412,7 +412,9 @@ static void add_buffer_to_buffer_list(stun_buffer_list *bufs, char *buf, size_t 
     buf_elem->buf.offset = 0;
     buf_elem->buf.coffset = 0;
     add_elem_to_buffer_list(bufs, buf_elem);
+    return true;
   }
+  return false;
 }
 
 static void free_blist_elem(ioa_engine_handle e, stun_buffer_list_elem *buf_elem) {
@@ -4270,7 +4272,16 @@ int udp_send(ioa_socket_handle s, const ioa_addr *dest_addr, const char *buffer,
 
 int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_network_buffer_handle nbh, int ttl,
                                   int tos, int *skip) {
+  return send_data_from_ioa_socket_nbh_with_admission(s, dest_addr, nbh, ttl, tos, skip, NULL);
+}
+
+int send_data_from_ioa_socket_nbh_with_admission(ioa_socket_handle s, ioa_addr *dest_addr,
+                                                 ioa_network_buffer_handle nbh, int ttl, int tos, int *skip,
+                                                 bool *admitted) {
   int ret = -1;
+  if (admitted) {
+    *admitted = false;
+  }
 
   if (!s) {
     ioa_network_buffer_delete(NULL, nbh);
@@ -4340,6 +4351,8 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_
         log_socket_event(s, "socket write failed, to be closed", 1);
         s->tobeclosed = 1;
         s->broken = 1;
+      } else if (admitted) {
+        *admitted = true;
       }
       /*
       bufferevent_flush(s->bev,
@@ -4359,7 +4372,13 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_
       if (ret < 0) {
         s->tobeclosed = 1;
       } else if (ret == 0) {
-        add_buffer_to_buffer_list(&(s->bufs), (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh));
+        const bool queued = add_buffer_to_buffer_list(&(s->bufs), (char *)ioa_network_buffer_data(nbh),
+                                                      ioa_network_buffer_get_size(nbh));
+        if (admitted) {
+          *admitted = queued;
+        }
+      } else if (admitted) {
+        *admitted = true;
       }
       break;
     }
@@ -4379,11 +4398,18 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_
        * tail delete below. */
       if (udp_sendmmsg_enqueue(s, dest_addr, nbh, ttl, tos)) {
         nbh = NULL;
+        if (admitted) {
+          *admitted = true;
+        }
         break;
       }
 
       udp_sendmmsg_flush_if_pending();
       ret = udp_send(s, dest_addr, (char *)ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh));
+      if (admitted) {
+        /* Direct UDP retains the legacy best-effort nonnegative outcome. */
+        *admitted = ret >= 0;
+      }
       if (ret < 0) {
         s->tobeclosed = 1;
 #if defined(EADDRNOTAVAIL)
@@ -4790,6 +4816,7 @@ void turn_report_allocation_set(void *a, turn_time_t lifetime, int refresh) {
 #endif
         {
           if (!refresh) {
+            turn_observe_created(server->observation, &ss->observation);
             prom_inc_allocation(get_ioa_socket_type(ss->client_socket));
             increment_global_allocation_count();
           }
@@ -4805,6 +4832,7 @@ void turn_report_allocation_delete(void *a, SOCKET_TYPE socket_type) {
     if (ss) {
       turn_turnserver *server = (turn_turnserver *)ss->server;
       if (server) {
+        turn_observe_closed(server->observation, &ss->observation);
         ioa_engine_handle e = turn_server_get_engine(server);
         if (e && e->verbose) {
           TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "allocation delete: realm=<%s>, username=<%s> (session %018llu)\n",

@@ -1182,6 +1182,7 @@ static char Usage[] =
     " --prometheus					Enable prometheus metrics. It is disabled by default. If it is "
     "enabled it will listen on port 9641 under the path /metrics\n"
     "						also the path / on this port can be used as a health check\n"
+    " --prometheus-observe-realm\t<realm>\tObserve this realm (repeatable, max 16; default: server realm).\n"
     " --prometheus-port		<port>		Prometheus metrics port (Default: 9641).\n"
     " --prometheus-address		<address>		Prometheus listening address (Default: any).\n"
     " --prometheus-path		<path>		Prometheus serve path (Default: /metrics).\n"
@@ -1589,6 +1590,7 @@ enum EXTRA_OPTS {
   CHANNEL_LIFETIME_OPT,
   PERMISSION_LIFETIME_OPT,
   PROMETHEUS_OPT,
+  PROMETHEUS_OBSERVE_REALM_OPT,
   PROMETHEUS_PORT_OPT,
   PROMETHEUS_ADDRESS_OPT,
   PROMETHEUS_PATH_OPT,
@@ -1737,6 +1739,7 @@ static const struct myoption long_options[] = {
 #endif
 #if !defined(TURN_NO_PROMETHEUS)
     {"prometheus", optional_argument, NULL, PROMETHEUS_OPT},
+    {"prometheus-observe-realm", required_argument, NULL, PROMETHEUS_OBSERVE_REALM_OPT},
     {"prometheus-port", required_argument, NULL, PROMETHEUS_PORT_OPT},
     {"prometheus-address", required_argument, NULL, PROMETHEUS_ADDRESS_OPT},
     {"prometheus-path", required_argument, NULL, PROMETHEUS_PATH_OPT},
@@ -2500,6 +2503,14 @@ static void set_option(int c, char *value) {
 #endif
   case PROMETHEUS_OPT:
     turn_params.prometheus = true;
+    break;
+  case PROMETHEUS_OBSERVE_REALM_OPT:
+    if (!turn_observe_add_realm(value)) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
+                    "Invalid prometheus-observe-realm: maximum 16 unique names, each at most %d bytes\n",
+                    STUN_MAX_REALM_SIZE);
+      exit(EXIT_FAILURE);
+    }
     break;
   case PROMETHEUS_PORT_OPT:
     turn_params.prometheus_port = get_port_value(value);
@@ -3916,6 +3927,14 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  realm_options_t observed_default = {0};
+  get_default_realm_options(&observed_default);
+#if defined(TURN_NO_PROMETHEUS)
+  turn_observe_start(observed_default.name, false, NULL);
+#else
+  turn_observe_start(observed_default.name, turn_params.prometheus, turn_read_quota_snapshot);
+#endif
 
   setup_server();
 

@@ -1236,7 +1236,9 @@ static void redis_reread_realms(secrets_list_t *realms_list) {
             rp->options.perf_options.max_bps = turn_params.max_bps;
             unlock_realms();
           } else {
+            lock_realms();
             rp->options.perf_options.max_bps = (band_limit_t)value;
+            unlock_realms();
           }
         }
         {
@@ -1246,7 +1248,9 @@ static void redis_reread_realms(secrets_list_t *realms_list) {
             rp->options.perf_options.total_quota = turn_params.total_quota;
             unlock_realms();
           } else {
+            lock_realms();
             rp->options.perf_options.total_quota = (vint)value;
+            unlock_realms();
           }
         }
         {
@@ -1256,7 +1260,9 @@ static void redis_reread_realms(secrets_list_t *realms_list) {
             rp->options.perf_options.user_quota = turn_params.user_quota;
             unlock_realms();
           } else {
+            lock_realms();
             rp->options.perf_options.user_quota = (vint)value;
+            unlock_realms();
           }
         }
       }

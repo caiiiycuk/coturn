@@ -1173,11 +1173,17 @@ static void mongo_reread_realms(secrets_list_t *realms_list) {
               }
               if (_v) {
                 if (!strcmp(_k, "max-bps")) {
+                  lock_realms();
                   rp->options.perf_options.max_bps = (band_limit_t)_v;
+                  unlock_realms();
                 } else if (!strcmp(_k, "total-quota")) {
+                  lock_realms();
                   rp->options.perf_options.total_quota = (vint)_v;
+                  unlock_realms();
                 } else if (!strcmp(_k, "user-quota")) {
+                  lock_realms();
                   rp->options.perf_options.user_quota = (vint)_v;
+                  unlock_realms();
                 } else {
                   TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Unknown realm option: %s\n", _k);
                 }

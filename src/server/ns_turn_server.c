@@ -214,8 +214,9 @@ static int refresh_relay_connection(turn_turnserver *server, ts_ur_super_session
                                     uint64_t in_reservation_token, uint64_t *out_reservation_token, int *err_code,
                                     int family);
 
+/* Control writes use -1; an empty peer datagram is still data activity. */
 static int write_client_connection(turn_turnserver *server, ts_ur_super_session *ss, ioa_network_buffer_handle nbh,
-                                   int ttl, int tos);
+                                   int ttl, int tos, int peer_payload);
 
 static void tcp_peer_accept_connection(ioa_socket_handle s, void *arg);
 
@@ -246,7 +247,12 @@ turn_time_t get_turn_server_time(turn_turnserver *server) {
 
 /////////////////// quota //////////////////////
 
-static int inc_quota(ts_ur_super_session *ss, uint8_t *username) {
+static int inc_quota(ts_ur_super_session *ss, uint8_t *username, turn_quota_cause *cause) {
+  turn_quota_cause ignored;
+  if (!cause) {
+    cause = &ignored;
+  }
+  *cause = TURN_QUOTA_OTHER;
   if (ss && !(ss->quota_used) && ss->server && ((turn_turnserver *)ss->server)->chquotacb && username) {
 
     if (((turn_turnserver *)ss->server)->ct == TURN_CREDENTIALS_LONG_TERM) {
@@ -255,7 +261,8 @@ static int inc_quota(ts_ur_super_session *ss, uint8_t *username) {
       }
     }
 
-    if ((((turn_turnserver *)ss->server)->chquotacb)(username, ss->oauth, (uint8_t *)ss->realm_options.name) < 0) {
+    if ((((turn_turnserver *)ss->server)->chquotacb)(username, ss->oauth, (uint8_t *)ss->realm_options.name, cause) <
+        0) {
 
       return -1;
 
@@ -924,6 +931,7 @@ static ts_ur_super_session *create_new_ss(turn_turnserver *server) {
   ts_ur_super_session *ss = (ts_ur_super_session *)turn_calloc(1, sizeof(ts_ur_super_session));
   ss->server = server;
   get_default_realm_options(&(ss->realm_options));
+  turn_observe_bind(server->observation, &ss->observation, ss->realm_options.name);
   put_session_into_map(ss);
   init_allocation(ss, &(ss->alloc), server->tcp_relay_connections);
   return ss;
@@ -1138,13 +1146,16 @@ static bool sweep_session_cb(ur_map_key_type key, ur_map_value_type value, void 
       mobile_abort_transition(server, ss);
     }
     sweep_allocation_timed_events(server, get_allocation_ss(ss));
+    turn_observe_visit(server->observation, &ss->observation);
   }
   return false; /* keep iterating all sessions */
 }
 
 static void turn_server_sweep_timed_events(turn_turnserver *server) {
   if (server && server->sessions_map) {
+    turn_observe_tick_begin(server->observation);
     ur_map_foreach_arg(server->sessions_map, sweep_session_cb, server);
+    turn_observe_publish(server->observation, server->ctime);
   }
 }
 
@@ -1449,7 +1460,11 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
           stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), oauth_remaining_lifetime(ss));
       uint64_t out_reservation_token = 0;
 
-      if (inc_quota(ss, username) < 0) {
+      turn_quota_cause quota_cause = TURN_QUOTA_OTHER;
+      if (inc_quota(ss, username, &quota_cause) < 0) {
+        if (server->observation) {
+          ss->observation.quota_cause = (uint8_t)quota_cause;
+        }
 
         *err_code = 486;
 
@@ -1465,6 +1480,9 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
             if (!(ss->bps)) {
               *err_code = 486;
               *reason = (const uint8_t *)"Allocation Bandwidth Quota Reached";
+              if (server->observation) {
+                ss->observation.quota_cause = TURN_QUOTA_BANDWIDTH;
+              }
             }
           }
         }
@@ -1686,6 +1704,7 @@ static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_sessi
     memcpy(ss->nonce, orig_ss->nonce, sizeof(ss->nonce));
     ss->nonce_expiration_time = orig_ss->nonce_expiration_time;
     memcpy(&(ss->realm_options), &(orig_ss->realm_options), sizeof(ss->realm_options));
+    turn_observe_bind(((turn_turnserver *)ss->server)->observation, &ss->observation, ss->realm_options.name);
     memcpy(ss->username, orig_ss->username, sizeof(ss->username));
     ss->hmackey_set = orig_ss->hmackey_set;
     memcpy(ss->hmackey, orig_ss->hmackey, sizeof(ss->hmackey));
@@ -1695,7 +1714,7 @@ static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_sessi
     memcpy(ss->pwd, orig_ss->pwd, sizeof(ss->pwd));
     ss->oauth_expiration_time = orig_ss->oauth_expiration_time;
     if (acquire_quota) {
-      inc_quota(ss, ss->username);
+      inc_quota(ss, ss->username, NULL);
     }
   }
 }
@@ -2014,6 +2033,7 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
           } else {
 
             get_realm_options_by_name(orig_ss->realm_options.name, &(ss->realm_options));
+            turn_observe_bind(server->observation, &ss->observation, ss->realm_options.name);
 
             // Check security:
             int postpone_reply = 0;
@@ -2127,7 +2147,7 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
 
                 *no_response = 1;
 
-                return write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
+                return write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE, -1);
               }
             }
 
@@ -2222,10 +2242,16 @@ static void tcp_deliver_delayed_buffer(unsent_buffer *ub, ioa_socket_handle s, t
 
       const uint32_t bytes = (uint32_t)ioa_network_buffer_get_size(nbh);
 
-      const int ret = send_data_from_ioa_socket_nbh(s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, NULL);
+      int skip = 0;
+      bool admitted = false;
+      const int ret =
+          send_data_from_ioa_socket_nbh_with_admission(s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, &skip, &admitted);
       if (ret < 0) {
         set_ioa_socket_tobeclosed(s);
       } else {
+        if (admitted) {
+          turn_observe_data(((turn_turnserver *)ss->server)->observation, &ss->observation, bytes);
+        }
         ++(ss->sent_packets);
         ss->sent_bytes += bytes;
         turn_report_session_usage(ss, 0);
@@ -2267,10 +2293,16 @@ static void tcp_peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_
     ss->peer_received_bytes += bytes;
   }
 
-  const int ret = send_data_from_ioa_socket_nbh(tc->client_s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, NULL);
+  int skip = 0;
+  bool admitted = false;
+  const int ret =
+      send_data_from_ioa_socket_nbh_with_admission(tc->client_s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, &skip, &admitted);
   if (ret < 0) {
     set_ioa_socket_tobeclosed(s);
   } else if (ss) {
+    if (admitted) {
+      turn_observe_data(((turn_turnserver *)ss->server)->observation, &ss->observation, bytes);
+    }
     ++(ss->sent_packets);
     ss->sent_bytes += bytes;
   }
@@ -2314,12 +2346,17 @@ static void tcp_client_input_handler_rfc6062data(ioa_socket_handle s, int event_
   }
 
   int skip = 0;
-  const int ret = send_data_from_ioa_socket_nbh(tc->peer_s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, &skip);
+  bool admitted = false;
+  const int ret =
+      send_data_from_ioa_socket_nbh_with_admission(tc->peer_s, NULL, nbh, TTL_IGNORE, TOS_IGNORE, &skip, &admitted);
   if (ret < 0) {
     set_ioa_socket_tobeclosed(s);
   }
 
   if (!skip && ss) {
+    if (admitted) {
+      turn_observe_data(((turn_turnserver *)ss->server)->observation, &ss->observation, bytes);
+    }
     ++(ss->peer_sent_packets);
     ss->peer_sent_bytes += bytes;
   }
@@ -2395,7 +2432,7 @@ static void tcp_peer_connection_completed_callback(int success, void *arg) {
       ioa_network_buffer_set_size(nbh, len);
     }
 
-    write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
+    write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE, -1);
 
     if (!success) {
       delete_tcp_connection(tc);
@@ -2596,7 +2633,7 @@ static void tcp_peer_accept_connection(ioa_socket_handle s, void *arg) {
       ioa_network_buffer_set_size(nbh, len);
     }
 
-    write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
+    write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE, -1);
 
     FUNCEND;
   }
@@ -3364,8 +3401,13 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss, in
         }
         ioa_network_buffer_header_init(nbh);
         int skip = 0;
-        send_data_from_ioa_socket_nbh(relay_s, &peer_addr, nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos, &skip);
+        bool admitted = false;
+        send_data_from_ioa_socket_nbh_with_admission(relay_s, &peer_addr, nbh, in_buffer->recv_ttl - 1,
+                                                     in_buffer->recv_tos, &skip, &admitted);
         if (!skip) {
+          if (admitted) {
+            turn_observe_data(server->observation, &ss->observation, (size_t)len);
+          }
           ++(ss->peer_sent_packets);
           ss->peer_sent_bytes += len;
           turn_report_session_usage(ss, 0);
@@ -3640,7 +3682,8 @@ static void resume_processing_after_username_check(int success, turn_key_lookup_
         if (realm && realm[0] && strcmp((char *)realm, ss->realm_options.name)) {
           dec_quota(ss);
           get_realm_options_by_name((char *)realm, &(ss->realm_options));
-          inc_quota(ss, ss->username);
+          turn_observe_bind(server->observation, &ss->observation, ss->realm_options.name);
+          inc_quota(ss, ss->username, NULL);
         }
       }
 
@@ -4196,6 +4239,7 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
               free(corigin);
               free(o);
               origin_found = get_realm_options_by_origin(ss->origin, &(ss->realm_options));
+              turn_observe_bind(server->observation, &ss->observation, ss->realm_options.name);
             }
           }
           sar = stun_attr_get_next_covered_str(ioa_network_buffer_data(in_buffer->nbh),
@@ -4233,6 +4277,9 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
       case STUN_METHOD_ALLOCATE:
 
       {
+        if (server->observation) {
+          ss->observation.quota_cause = TURN_QUOTA_OTHER;
+        }
         handle_turn_allocate(server, ss, &tid, resp_constructed, &err_code, &reason, unknown_attrs, &ua_num, in_buffer,
                              nbh);
 
@@ -4462,6 +4509,10 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
       *resp_constructed = 1;
     }
 
+    if (method == STUN_METHOD_ALLOCATE && *resp_constructed) {
+      turn_observe_result(server->observation, &ss->observation, err_code);
+    }
+
     maybe_add_software_attribute(server, nbh);
 
     if (message_integrity) {
@@ -4668,9 +4719,14 @@ static int write_to_peerchannel(ts_ur_super_session *ss, uint16_t chnum, ioa_net
       ioa_network_buffer_header_init(nbh);
 
       int skip = 0;
-      rc = send_data_from_ioa_socket_nbh(relay_s, &(chn->peer_addr), nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos,
-                                         &skip);
+      bool admitted = false;
+      rc = send_data_from_ioa_socket_nbh_with_admission(relay_s, &(chn->peer_addr), nbh, in_buffer->recv_ttl - 1,
+                                                        in_buffer->recv_tos, &skip, &admitted);
 
+      if (admitted) {
+        turn_observe_data(((turn_turnserver *)ss->server)->observation, &ss->observation,
+                          in_size - STUN_CHANNEL_HEADER_LENGTH);
+      }
       if (!skip && rc > -1) {
         ++(ss->peer_sent_packets);
         ss->peer_sent_bytes += (uint32_t)in_size;
@@ -4871,7 +4927,7 @@ static void client_to_be_allocated_timeout_handler(ioa_engine_handle e, void *ar
 }
 
 static int write_client_connection(turn_turnserver *server, ts_ur_super_session *ss, ioa_network_buffer_handle nbh,
-                                   int ttl, int tos) {
+                                   int ttl, int tos, int peer_payload) {
 
   FUNCSTART;
 
@@ -4890,9 +4946,14 @@ static int write_client_connection(turn_turnserver *server, ts_ur_super_session 
     }
 
     int skip = 0;
-    const int ret = send_data_from_ioa_socket_nbh(ss->client_socket, NULL, nbh, ttl, tos, &skip);
+    bool admitted = false;
+    const int ret =
+        send_data_from_ioa_socket_nbh_with_admission(ss->client_socket, NULL, nbh, ttl, tos, &skip, &admitted);
 
     if (!skip && ret > -1) {
+      if (admitted && peer_payload >= 0) {
+        turn_observe_data(server->observation, &ss->observation, (size_t)peer_payload);
+      }
       ++(ss->sent_packets);
       ss->sent_bytes += (uint32_t)ioa_network_buffer_get_size(nbh);
       turn_report_session_usage(ss, 0);
@@ -4949,6 +5010,9 @@ static void client_ss_allocation_timeout_handler(ioa_engine_handle e, void *arg)
   }
 
   if (!get_relay_socket(a, AF_INET) && !get_relay_socket(a, AF_INET6)) {
+    if (server->observation && ss->observation.active) {
+      ss->observation.close_reason = ss->observation.timer_reason[family == AF_INET6];
+    }
     shutdown_client_connection(server, ss, 0, "allocation timeout");
   }
 
@@ -5107,6 +5171,7 @@ static int refresh_relay_connection(turn_turnserver *server, ts_ur_super_session
 
   if (server && ss && is_allocation_valid(a)) {
 
+    const uint8_t reason = lifetime ? TURN_CLOSE_EXPIRED : TURN_CLOSE_DELETE;
     if (lifetime < 1) {
       lifetime = 1;
     }
@@ -5116,6 +5181,9 @@ static int refresh_relay_connection(turn_turnserver *server, ts_ur_super_session
                       "refresh_client_ss_allocation_timeout_handler");
 
     set_allocation_lifetime_ev(a, server->ctime + lifetime, ev, family);
+    if (server->observation && ss->observation.active) {
+      ss->observation.timer_reason[family == AF_INET6] = reason;
+    }
 
     return 0;
 
@@ -5254,7 +5322,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
         ioa_network_buffer_set_size(nbh, len);
       }
 
-      const int ret = write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
+      const int ret = write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE, -1);
 
       if (ss->close_after_auth_challenge) {
         ss->close_after_auth_challenge = false;
@@ -5279,7 +5347,7 @@ static int read_client_connection(turn_turnserver *server, ts_ur_super_session *
 
     if (resp_constructed) {
 
-      const int ret = write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE);
+      const int ret = write_client_connection(server, ss, nbh, TTL_IGNORE, TOS_IGNORE, -1);
 
       FUNCEND;
       return ret;
@@ -5568,7 +5636,7 @@ static void peer_input_handler(ioa_socket_handle s, int event_type, ioa_net_data
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Send data: 0x%x\n", (int)(nswap16(t[0])));
   }
 
-  write_client_connection(server, ss, nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos);
+  write_client_connection(server, ss, nbh, in_buffer->recv_ttl - 1, in_buffer->recv_tos, ilen);
 }
 
 static void client_input_handler(ioa_socket_handle s, int event_type, ioa_net_data *data, void *arg, int can_resume) {
@@ -5634,6 +5702,7 @@ void init_turn_server(turn_turnserver *server, turnserver_id id, int verbose, io
   server->e = e;
   server->id = id;
   server->ctime = turn_time();
+  server->observation = turn_observe_owner_new();
   server->session_id_counter = 0;
   server->sessions_map = ur_map_create();
   server->tcp_relay_connections = ur_map_create();

@@ -107,7 +107,7 @@ typedef void (*get_username_resume_cb)(int success, turn_key_lookup_result key_l
 typedef uint8_t *(*get_user_key_cb)(turnserver_id id, turn_credential_type ct, int in_oauth, int *out_oauth,
                                     uint8_t *uname, uint8_t *realm, get_username_resume_cb resume,
                                     ioa_net_data *in_buffer, uint64_t ctxkey, int *postpone_reply);
-typedef int (*check_new_allocation_quota_cb)(uint8_t *username, int oauth, uint8_t *realm);
+typedef int (*check_new_allocation_quota_cb)(uint8_t *username, int oauth, uint8_t *realm, turn_quota_cause *cause);
 typedef void (*release_allocation_quota_cb)(uint8_t *username, int oauth, uint8_t *realm);
 typedef int (*send_socket_to_relay_cb)(turnserver_id id, uint64_t cid, stun_tid *tid, ioa_socket_handle s,
                                        int message_integrity, MESSAGE_TO_RELAY_TYPE rmt, ioa_net_data *nd,
@@ -127,6 +127,7 @@ struct _turn_turnserver {
   ur_map *sessions_map;
 
   turn_time_t ctime;
+  turn_observe_owner *observation;
 
   ioa_engine_handle e;
   int verbose;

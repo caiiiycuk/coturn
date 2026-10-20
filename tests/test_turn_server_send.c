@@ -114,6 +114,17 @@ typedef struct {
 } test_socket;
 
 static test_socket relay_socket_v4 = {AF_INET};
+static int close_after_processing_calls;
+
+SOCKET_APP_TYPE get_ioa_socket_app_type(const ioa_socket_handle s) {
+  (void)s;
+  return CLIENT_SOCKET;
+}
+
+void close_ioa_socket_after_processing_if_necessary(ioa_socket_handle s) {
+  UNUSED_ARG(s);
+  ++close_after_processing_calls;
+}
 
 int get_ioa_socket_address_family(const ioa_socket_handle s) { return ((const test_socket *)s)->family; }
 
@@ -134,8 +145,17 @@ static struct {
   int df;
 } sent_capture;
 
+static bool turn_test_drop_bandwidth;
+static bool turn_test_refuse_admission;
+static int turn_test_send_result;
 int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_network_buffer_handle nbh, int ttl,
                                   int tos, int *skip) {
+  return send_data_from_ioa_socket_nbh_with_admission(s, dest_addr, nbh, ttl, tos, skip, NULL);
+}
+
+int send_data_from_ioa_socket_nbh_with_admission(ioa_socket_handle s, ioa_addr *dest_addr,
+                                                 ioa_network_buffer_handle nbh, int ttl, int tos, int *skip,
+                                                 bool *admitted) {
   sent_capture.calls++;
   sent_capture.s = s;
   sent_capture.ttl = ttl;
@@ -149,9 +169,12 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_
   }
   memcpy(sent_capture.payload, ioa_network_buffer_data(nbh), sent_capture.len);
   if (skip) {
-    *skip = 0;
+    *skip = turn_test_drop_bandwidth;
   }
-  return (int)sent_capture.len;
+  if (admitted) {
+    *admitted = !turn_test_refuse_admission && !turn_test_drop_bandwidth;
+  }
+  return turn_test_send_result < 0 ? (int)sent_capture.len : turn_test_send_result;
 }
 
 int set_df_on_ioa_socket(ioa_socket_handle s, int value) {
@@ -178,6 +201,10 @@ void clear_ioa_socket_session_if(ioa_socket_handle s, void *ss_arg) {
 }
 
 void close_ioa_socket(ioa_socket_handle s) { UNUSED_ARG(s); }
+int ioa_socket_tobeclosed(ioa_socket_handle s) {
+  (void)s;
+  return 0;
+}
 
 /* is_multiplex_peer_udp_relay() short-circuits on !server->multiplex_peer_mode,
  * so this is only reached if a test opts into multiplex-peer mode. */
@@ -279,6 +306,13 @@ void setUp(void) {
   on_blacklist_unlock = NULL;
   memset(last_realm_lookup, 0, sizeof(last_realm_lookup));
 
+  turn_test_drop_bandwidth = false;
+  turn_test_refuse_admission = false;
+  turn_test_send_result = -1;
+  close_after_processing_calls = 0;
+  server.observation = turn_observe_owner_new();
+  turn_observe_bind(server.observation, &ss.observation, "observed");
+  turn_observe_created(server.observation, &ss.observation);
   server.dont_fragment = DONT_FRAGMENT_UNSUPPORTED;
 
   /* The tests relay to 127.0.0.x, which good_peer_addr() rejects by default. */
@@ -969,8 +1003,232 @@ static void test_random_challenge_nonce_is_sixteen_lowercase_hex_chars(void) {
   }
 }
 
+static void test_observation_accepts_payload_only_after_permission(void) {
+  ioa_addr peer = {0};
+  make_addr(&peer, PEER_A, PEER_PORT_A);
+  const uint8_t payload[] = {1, 2, 3, 4, 5};
+  make_send_indication(&peer, 1, payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(0, run_send());
+  TEST_ASSERT_EQUAL_UINT32(0, ss.observation.bytes);
+  add_permission(PEER_A, PEER_PORT_A);
+  turn_test_drop_bandwidth = true;
+  make_send_indication(&peer, 1, payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(0, run_send());
+  TEST_ASSERT_EQUAL_UINT32(0, ss.observation.bytes);
+  turn_test_drop_bandwidth = false;
+  make_send_indication(&peer, 1, payload, sizeof(payload));
+  TEST_ASSERT_EQUAL(0, run_send());
+  TEST_ASSERT_EQUAL_UINT32(sizeof(payload), ss.observation.bytes);
+}
+
+static void test_observation_counts_prebind_tcp_payload_once_when_forwarded(void) {
+  tcp_connection tc = {0};
+  tc.owner = &ss.alloc;
+  tc.state = TC_STATE_PEER_CONNECTED;
+  ioa_net_data input = {0};
+  input.nbh = &test_nbh;
+  test_nbh.len = 5;
+  tcp_peer_input_handler((ioa_socket_handle)&relay_socket_v4, IOA_EV_READ, &input, &tc, 0);
+  TEST_ASSERT_EQUAL_UINT32(0, ss.observation.bytes);
+  TEST_ASSERT_NULL(input.nbh);
+  tc.state = TC_STATE_READY;
+  tc.client_s = (ioa_socket_handle)&relay_socket_v4;
+  tcp_deliver_delayed_buffer(&tc.ub_to_client, tc.client_s, &ss);
+  TEST_ASSERT_EQUAL_UINT32(5, ss.observation.bytes);
+  tcp_deliver_delayed_buffer(&tc.ub_to_client, tc.client_s, &ss);
+  TEST_ASSERT_EQUAL_UINT32(5, ss.observation.bytes);
+  clear_unsent_buffer(&tc.ub_to_client);
+}
+
+static const char *quota_from;
+static const char *quota_to;
+static unsigned quota_releases, quota_acquires;
+
+static void test_oauth_release_quota(uint8_t *username, int oauth, uint8_t *realm) {
+  TEST_ASSERT_EQUAL_STRING("oauth-user", username);
+  TEST_ASSERT_EQUAL_INT(1, oauth);
+  TEST_ASSERT_EQUAL_STRING(quota_from, realm);
+  TEST_ASSERT_EQUAL_UINT(quota_acquires, quota_releases);
+  ++quota_releases;
+}
+
+static int test_oauth_acquire_quota(uint8_t *username, int oauth, uint8_t *realm, turn_quota_cause *cause) {
+  TEST_ASSERT_EQUAL_STRING("oauth-user", username);
+  TEST_ASSERT_EQUAL_INT(1, oauth);
+  TEST_ASSERT_EQUAL_STRING(quota_to, realm);
+  TEST_ASSERT_EQUAL_UINT(quota_acquires + 1, quota_releases);
+  TEST_ASSERT_EQUAL_INT(TURN_QUOTA_OTHER, *cause);
+  ++quota_acquires;
+  return 0;
+}
+
+static void resume_oauth_in_realm(const char *realm, uint8_t index) {
+  hmackey_t key = {0};
+  password_t password = {0};
+  memset(key, 0x5a, sizeof(key));
+  memcpy(password, "verified-password", sizeof("verified-password"));
+  ioa_net_data input = {.nbh = &test_nbh};
+  const turn_observe_session before = ss.observation;
+  quota_from = ss.realm_options.name;
+  char old_realm[STUN_MAX_REALM_SIZE + 1];
+  STRCPY(old_realm, quota_from);
+  quota_from = old_realm;
+  quota_to = realm;
+  /* The actual async auth continuation consumes the successful key lookup.
+   * Empty input is ignored by the real client reader; no protocol I/O is stubbed in. */
+  resume_processing_after_username_check(1, TURN_KEY_LOOKUP_OK, 1, 123456, key, password, &server, ss.id, &input,
+                                         (uint8_t *)realm);
+  TEST_ASSERT_NULL(input.nbh);
+  TEST_ASSERT_EQUAL_STRING(realm, ss.realm_options.name);
+  TEST_ASSERT_EQUAL_UINT8(index, ss.observation.realm);
+  TEST_ASSERT_EQUAL_UINT8(1, ss.observation.active);
+  TEST_ASSERT_EQUAL_UINT64(before.created, ss.observation.created);
+  TEST_ASSERT_EQUAL_UINT64(before.last_data, ss.observation.last_data);
+  TEST_ASSERT_EQUAL_UINT32(before.bytes, ss.observation.bytes);
+  TEST_ASSERT_EQUAL_UINT8(before.timer_reason[0], ss.observation.timer_reason[0]);
+  TEST_ASSERT_EQUAL_UINT8(before.close_reason, ss.observation.close_reason);
+  TEST_ASSERT_EQUAL_INT(1, ss.oauth);
+  TEST_ASSERT_EQUAL_INT(1, ss.quota_used);
+  TEST_ASSERT_EQUAL_INT(1, ss.hmackey_set);
+  TEST_ASSERT_EQUAL_UINT64(123456, ss.oauth_expiration_time);
+  TEST_ASSERT_EQUAL_MEMORY(key, ss.hmackey, sizeof(key));
+  TEST_ASSERT_EQUAL_MEMORY(password, ss.pwd, sizeof(password));
+}
+
+static void test_oauth_auth_resume_moves_observation_without_new_lifecycle(void) {
+  server.oauth = 1;
+  server.ct = TURN_CREDENTIALS_LONG_TERM;
+  server.chquotacb = test_oauth_acquire_quota;
+  server.raqcb = test_oauth_release_quota;
+  server.sessions_map = ur_map_create();
+  ss.id = 1;
+  TEST_ASSERT_TRUE(ur_map_put(server.sessions_map, ss.id, (ur_map_value_type)&ss));
+  ss.client_socket = (ioa_socket_handle)&relay_socket_v4;
+  ss.oauth = 1;
+  ss.origin_set = 1;
+  ss.quota_used = 1;
+  STRCPY(ss.username, "oauth-user");
+  STRCPY(ss.realm_options.name, "observed");
+  quota_releases = quota_acquires = 0;
+  turn_observe_data(server.observation, &ss.observation, 65536);
+  resume_oauth_in_realm("observed-B", 2);
+  resume_oauth_in_realm("outside", 0);
+  turn_observe_data(server.observation, &ss.observation, 1);
+  resume_oauth_in_realm("observed", 1);
+  TEST_ASSERT_EQUAL_UINT32(65537, ss.observation.bytes);
+  TEST_ASSERT_EQUAL_UINT(3, quota_releases);
+  TEST_ASSERT_EQUAL_UINT(3, quota_acquires);
+
+  /* A different logical allocation was outside coverage from its creation. */
+  ss.observation = (turn_observe_session){0};
+  STRCPY(ss.realm_options.name, "outside");
+  turn_observe_bind(server.observation, &ss.observation, "outside");
+  turn_observe_created(server.observation, &ss.observation);
+  turn_observe_data(server.observation, &ss.observation, 17);
+  resume_oauth_in_realm("observed-B", 2);
+  TEST_ASSERT_EQUAL_UINT32(17, ss.observation.bytes);
+  TEST_ASSERT_EQUAL_UINT(4, quota_releases);
+  TEST_ASSERT_EQUAL_UINT(4, quota_acquires);
+  TEST_ASSERT_EQUAL_INT(4, close_after_processing_calls);
+  TEST_ASSERT_TRUE(sizeof(ss.observation) <= 32);
+  ur_map_free(&server.sessions_map);
+}
+
+/* Every activity consumer sees the same independent IO signal. The real IO
+ * branches producing that signal are exercised by test_ioa_send_admission. */
+static void test_observation_all_six_consumers_preserve_legacy_counters(void) {
+  ioa_addr peer = {0};
+  make_addr(&peer, PEER_A, PEER_PORT_A);
+  add_permission(PEER_A, PEER_PORT_A);
+  TEST_ASSERT_NOT_NULL(allocation_get_new_ch_info(&ss.alloc, TEST_CHANNEL_NUMBER, &peer));
+  ss.client_socket = (ioa_socket_handle)&relay_socket_v4;
+  tcp_connection tc = {0};
+  tc.owner = &ss.alloc;
+  tc.state = TC_STATE_READY;
+  tc.client_s = tc.peer_s = ss.client_socket;
+  const uint8_t payload[] = {1, 2, 3, 4, 5};
+  for (int consumer = 0; consumer < 6; ++consumer) {
+    for (int outcome = 0; outcome < 4; ++outcome) {
+      /* Positive veto, zero veto, successful enqueue, bandwidth skip. */
+      turn_test_refuse_admission = outcome < 2;
+      turn_test_send_result = outcome == 1 || outcome == 2 ? 0 : -1;
+      turn_test_drop_bandwidth = outcome == 3;
+      ss.observation.bytes = 0;
+      ss.observation.last_data = 1;
+      const uint32_t sent = ss.sent_packets, peer_sent = ss.peer_sent_packets;
+      const uint32_t sent_bytes = ss.sent_bytes, peer_sent_bytes = ss.peer_sent_bytes;
+      const int calls = sent_capture.calls;
+      memset(&test_nbh, 0, sizeof(test_nbh));
+      test_nbh.len = sizeof(payload);
+      memcpy(test_nbh.buf, payload, sizeof(payload));
+      ioa_net_data input = {0};
+      input.nbh = &test_nbh;
+      input.recv_ttl = 64;
+      input.src_addr = peer;
+      switch (consumer) {
+      case 0:
+        add_unsent_buffer(&tc.ub_to_client, input.nbh);
+        tcp_deliver_delayed_buffer(&tc.ub_to_client, tc.client_s, &ss);
+        tcp_deliver_delayed_buffer(&tc.ub_to_client, tc.client_s, &ss);
+        break;
+      case 1:
+        tcp_peer_input_handler(tc.peer_s, IOA_EV_READ, &input, &tc, 0);
+        break;
+      case 2:
+        tcp_client_input_handler_rfc6062data(tc.client_s, IOA_EV_READ, &input, &tc, 0);
+        break;
+      case 3:
+        make_send_indication(&peer, 1, payload, sizeof(payload));
+        TEST_ASSERT_EQUAL_INT(0, run_send());
+        break;
+      case 4:
+        test_nbh.len += STUN_CHANNEL_HEADER_LENGTH;
+        TEST_ASSERT_TRUE(write_to_peerchannel(&ss, TEST_CHANNEL_NUMBER, &input) >= 0);
+        break;
+      case 5:
+        test_nbh.offset = STUN_CHANNEL_HEADER_LENGTH;
+        peer_input_handler(ss.client_socket, IOA_EV_READ, &input, &ss, 0);
+        break;
+      }
+      TEST_ASSERT_EQUAL_INT(calls + 1, sent_capture.calls);
+      TEST_ASSERT_EQUAL_UINT32(outcome == 2 ? sizeof(payload) : 0, ss.observation.bytes);
+      if (outcome == 2) {
+        TEST_ASSERT_TRUE(ss.observation.last_data > 1);
+      } else {
+        TEST_ASSERT_EQUAL_UINT64(1, ss.observation.last_data);
+      }
+      const bool to_peer = consumer >= 2 && consumer <= 4;
+      const bool legacy_counted = !(outcome == 3 && consumer >= 2);
+      TEST_ASSERT_EQUAL_UINT32(sent + (!to_peer && legacy_counted), ss.sent_packets);
+      TEST_ASSERT_EQUAL_UINT32(peer_sent + (to_peer && legacy_counted), ss.peer_sent_packets);
+      TEST_ASSERT_EQUAL_UINT32(sent_bytes + (!to_peer && legacy_counted ? sent_capture.len : 0), ss.sent_bytes);
+      TEST_ASSERT_EQUAL_UINT32(
+          peer_sent_bytes + (to_peer && legacy_counted
+                                 ? (consumer == 4 ? sizeof(payload) + STUN_CHANNEL_HEADER_LENGTH : sizeof(payload))
+                                 : 0),
+          ss.peer_sent_bytes);
+    }
+  }
+  /* Framed/control output cannot become payload activity. */
+  turn_test_refuse_admission = turn_test_drop_bandwidth = false;
+  ss.observation.bytes = 0;
+  ss.observation.last_data = 1;
+  write_client_connection(&server, &ss, &test_nbh, TTL_IGNORE, TOS_IGNORE, -1);
+  TEST_ASSERT_EQUAL_UINT32(0, ss.observation.bytes);
+  TEST_ASSERT_EQUAL_UINT64(1, ss.observation.last_data);
+}
+
 int main(void) {
+  turn_observe_add_realm("observed");
+  turn_observe_add_realm("observed-B");
+  turn_observe_start("observed", true, NULL);
   UNITY_BEGIN();
+#if !defined(TURN_NO_PROMETHEUS)
+  RUN_TEST(test_oauth_auth_resume_moves_observation_without_new_lifecycle);
+  RUN_TEST(test_observation_all_six_consumers_preserve_legacy_counters);
+  RUN_TEST(test_observation_accepts_payload_only_after_permission);
+  RUN_TEST(test_observation_counts_prebind_tcp_payload_once_when_forwarded);
+#endif
   RUN_TEST(test_send_relays_payload_to_the_permitted_peer);
   RUN_TEST(test_send_uses_first_of_duplicate_peer_addresses);
   RUN_TEST(test_send_is_dropped_when_only_a_later_peer_is_permitted);

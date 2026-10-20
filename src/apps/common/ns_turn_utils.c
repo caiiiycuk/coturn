@@ -81,6 +81,11 @@ static inline turn_time_t log_time(void) {
 
 #define MAGIC_CODE (0xEFCD1983)
 
+int turn_mutex_trylock(const turn_mutex *mutex) {
+  return mutex && mutex->mutex && mutex->data == MAGIC_CODE ? pthread_mutex_trylock((pthread_mutex_t *)mutex->mutex)
+                                                            : -1;
+}
+
 int turn_mutex_lock(const turn_mutex *mutex) {
   if (mutex && mutex->mutex && (mutex->data == MAGIC_CODE)) {
     int ret = 0;

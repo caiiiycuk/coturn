@@ -40,6 +40,7 @@
 #include "ns_turn_maps.h"
 #include "ns_turn_utils.h"
 
+#include "turn_observability.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -160,8 +161,10 @@ struct _ts_ur_super_session {
    * resuming session (new client path) is kept alive and linked, so peer->client
    * traffic keeps flowing on the old 5-tuple until the client sends on the new
    * one (or a bounded deadline elapses). See docs/mobility-rfc8016.md. */
-  turnsession_id mobile_resume_target;    /* resuming session -> allocation session id being resumed */
-  turnsession_id mobile_pending_resume;   /* allocation session -> resuming session id */
+  turnsession_id mobile_resume_target;  /* resuming session -> allocation session id being resumed */
+  turnsession_id mobile_pending_resume; /* allocation session -> resuming session id */
+  /* Keep observation beside the mobility state already read by the owning sweep. */
+  turn_observe_session observation;
   turn_time_t mobile_transition_deadline; /* allocation session: promote/abort by this time */
   /* Bandwidth */
   band_limit_t bps;

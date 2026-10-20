@@ -1216,11 +1216,17 @@ static void sqlite_reread_realms(secrets_list_t *realms_list) {
 
           realm_params_t *rp = get_realm(rval);
           if (strcmp(oval, "max-bps") == 0) {
+            lock_realms();
             rp->options.perf_options.max_bps = (band_limit_t)strtoul(vval, NULL, 10);
+            unlock_realms();
           } else if (strcmp(oval, "total-quota") == 0) {
+            lock_realms();
             rp->options.perf_options.total_quota = (vint)atoi(vval);
+            unlock_realms();
           } else if (strcmp(oval, "user-quota") == 0) {
+            lock_realms();
             rp->options.perf_options.user_quota = (vint)atoi(vval);
+            unlock_realms();
           } else {
             TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Unknown realm option: %s\n", oval);
           }

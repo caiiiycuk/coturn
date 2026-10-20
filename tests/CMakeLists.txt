@@ -16,6 +16,14 @@ function(coturn_add_test name)
     set(COTURN_TEST_TARGETS ${COTURN_TEST_TARGETS} PARENT_SCOPE)
 endfunction()
 
+coturn_add_test(test_turn_observability)
+target_include_directories(test_turn_observability PRIVATE ../src/server)
+add_executable(test_turn_observability_disabled test_turn_observability.c)
+target_include_directories(test_turn_observability_disabled PRIVATE ../src/server)
+target_compile_definitions(test_turn_observability_disabled PRIVATE TURN_NO_PROMETHEUS)
+target_link_libraries(test_turn_observability_disabled PRIVATE turnclient unity)
+add_test(NAME test_turn_observability_disabled COMMAND test_turn_observability_disabled)
+list(APPEND COTURN_TEST_TARGETS test_turn_observability_disabled)
 coturn_add_test(test_ioaddr)
 coturn_add_test(test_stun_msg)
 coturn_add_test(test_oauth_integrity)
@@ -50,6 +58,13 @@ target_compile_definitions(test_convert_key PRIVATE
 target_link_libraries(test_convert_key PRIVATE turnclient unity)
 add_test(NAME test_convert_key COMMAND test_convert_key)
 list(APPEND COTURN_TEST_TARGETS test_convert_key)
+
+coturn_add_test(test_userdb_observation ../src/server/ns_turn_maps.c)
+target_include_directories(test_userdb_observation PRIVATE ../src/server ../src)
+target_compile_definitions(test_userdb_observation PRIVATE
+    TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ TURN_NO_SQLITE TURN_NO_PROMETHEUS
+    TURN_NO_SCTP TURN_NO_SYSTEMD TURN_NO_THREAD_BARRIERS TURN_NO_HIREDIS)
+set_tests_properties(test_userdb_observation PROPERTIES TIMEOUT 10)
 
 # Multiplex-peer demux table: per-session registration cap and per-session
 # deregistration. The module is self-contained, so it is compiled together
@@ -89,6 +104,7 @@ set_tests_properties(test_alt_server_list PROPERTIES TIMEOUT 60)
 # libturn_server, which would define ns_turn_server.c twice.
 coturn_add_test(test_turn_server_send
     test_turn_server_stubs.c
+    ../src/server/turn_observability.c
     ../src/server/ns_turn_allocation.c
     ../src/server/ns_turn_maps.c
     ../src/server/ns_turn_maps_rtcp.c
@@ -101,9 +117,23 @@ target_include_directories(test_turn_server_send PRIVATE
     ${OPENSSL_INCLUDE_DIR}
     ${LIBEVENT_INCLUDE_DIRS})
 target_compile_definitions(test_turn_server_send PRIVATE
-    TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ TURN_NO_PROMETHEUS
+    TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ
     TURN_NO_SCTP TURN_NO_SYSTEMD TURN_NO_THREAD_BARRIERS TURN_NO_HIREDIS
     _FILE_OFFSET_BITS=64)
+
+# The IO implementation is included to execute its private transport branches.
+# Discard unrelated listener/DB paths rather than replacing the send helper.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE AND NOT WIN32)
+    coturn_add_test(test_ioa_send_admission)
+    target_include_directories(test_ioa_send_admission PRIVATE
+        ../src/server ../src/apps/common ../src ../src/client ../src/prometheus
+        ${OPENSSL_INCLUDE_DIR} ${LIBEVENT_INCLUDE_DIRS})
+    target_compile_definitions(test_ioa_send_admission PRIVATE
+        TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ TURN_NO_SCTP TURN_NO_SYSTEMD
+        TURN_NO_THREAD_BARRIERS TURN_NO_HIREDIS _FILE_OFFSET_BITS=64)
+    target_compile_options(test_ioa_send_admission PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(test_ioa_send_admission PRIVATE -Wl,--gc-sections)
+endif()
 
 # Relay port-allocator counter-wrap regression test (#1649). The allocator's
 # uint32_t low/high cursors wrap after ~4G alloc/release operations on a pool;
@@ -272,6 +302,13 @@ if(HIREDIS_FOUND AND LIBEVENT_FOUND)
     list(APPEND COTURN_TEST_TARGETS test_redis_libevent_cleanup)
 else()
     message(STATUS "hiredis/libevent not found; skipping Redis tests")
+endif()
+
+find_package(MicroHTTPD)
+if(MicroHTTPD_FOUND)
+    coturn_add_test(test_prom_server_observation ../src/server/turn_observability.c)
+    target_include_directories(test_prom_server_observation PRIVATE ../src/server ../src/prometheus ${MicroHTTPD_INCLUDE_DIRS})
+    target_link_libraries(test_prom_server_observation PRIVATE ${MicroHTTPD_LIBRARIES})
 endif()
 
 # Vendored Prometheus client (src/prometheus). Fully self-contained: only the
