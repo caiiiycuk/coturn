@@ -80,7 +80,8 @@ def server(extra=(), realms=(), known_realms=(), default='observed', slow_reader
                                    ('https://r' + str(len(realm)) + '-' + str(known_realms.index(realm)) + '.test', realm))
         turn_port, metrics_port = port(), port()
         command = [str(BINDIR / 'turnserver'), '-n', '--realm=' + default, '--user=user:pass',
-                   '--db=' + str(database), '--listening-ip=127.0.0.1', '--relay-ip=127.0.0.1',
+                   '--db=' + str(database), '--pidfile=' + str(directory / 'turnserver.pid'),
+                   '--listening-ip=127.0.0.1', '--relay-ip=127.0.0.1',
                    '--listening-port=' + str(turn_port), '--prometheus', '--prometheus-address=127.0.0.1',
                    '--prometheus-port=' + str(metrics_port), '--relay-threads=2', '--no-tls', '--no-cli',
                    '--allow-loopback-peers', '--log-file=stdout']
@@ -182,6 +183,49 @@ def check_lifecycle_and_responses():
         finally:
             one.close()
     print('OK: real Allocate/retransmit/user-quota/delete and concurrent scrape counters')
+
+
+def check_binding_at_total_quota():
+    with server(extra=('--total-quota=1', '--user-quota=0')) as (turn_port, _, scrape, _):
+        wait_for(lambda: value(samples(scrape()), FAMILIES[-1]) > 0, 'snapshot not ready')
+        one, two = Allocation(turn_port), Allocation(turn_port)
+        try:
+            assert one.socket.getsockname() != two.socket.getsockname()
+            assert one.allocate()[0] == ALLOCATE_OK
+            wait_for(lambda: value(samples(scrape()), FAMILIES[0], realm='observed') == 1,
+                     'single-family allocation did not consume exactly one quota unit')
+            typ, attrs = two.allocate()
+            assert typ == 0x0113 and errcode(attrs) == 486, (typ, errcode(attrs))
+            wait_for(lambda: value(samples(scrape()), FAMILIES[2], realm='observed', code='486', cause='total_quota') == 1,
+                     'authenticated second Allocate did not hit total quota')
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as binding:
+                binding.settimeout(3)
+                binding.connect(('127.0.0.1', turn_port))
+                request = make(0x0001, [])
+                binding.send(request)
+                response = binding.recv(65536)
+                typ, attrs = parse(response)
+                assert typ == 0x0101 and response[4:20] == request[4:20]
+                mapped = get(attrs, 0x0020)
+                assert mapped is not None and len(mapped) == 8 and mapped[:2] == b'\0\x01'
+                mapped_port = struct.unpack('!H', mapped[2:4])[0] ^ 0x2112
+                mapped_ip = socket.inet_ntoa(bytes(a ^ b for a, b in zip(mapped[4:], request[4:8])))
+                assert (mapped_ip, mapped_port) == binding.getsockname()
+            current = samples(scrape())
+            assert value(current, FAMILIES[0], realm='observed') == 1
+            assert value(current, FAMILIES[3], realm='observed') == 1
+            assert parse(xact(one.socket, one.request(M_REFRESH, [(A_LIFETIME, struct.pack('!I', 0))])))[0] == REFRESH_OK
+            wait_for(lambda: value(samples(scrape()), FAMILIES[0], realm='observed') == 0,
+                     'explicit release did not free quota')
+            assert two.allocate()[0] == ALLOCATE_OK
+            wait_for(lambda: value(samples(scrape()), FAMILIES[0], realm='observed') == 1,
+                     'Allocate after release did not reacquire quota')
+        finally:
+            one.close()
+            two.close()
+        wait_for(lambda: value(samples(scrape()), FAMILIES[0], realm='observed') == 0,
+                 'test allocations retained quota after cleanup')
+    print('OK: total-quota=1 rejects authenticated Allocate with 486; UDP Binding preserves transaction/mapped address and quota; release permits Allocate')
 
 
 def check_final_errors_and_limits():
@@ -486,6 +530,7 @@ def check_cardinality_and_unknown():
 
 if __name__ == '__main__':
     check_lifecycle_and_responses()
+    check_binding_at_total_quota()
     check_final_errors_and_limits()
     check_stateless_udp_results()
     check_expiry_refresh_and_partial_family()
