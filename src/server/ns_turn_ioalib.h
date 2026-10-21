@@ -90,6 +90,7 @@ typedef struct _turn_mutex turn_mutex;
 int turn_mutex_init(turn_mutex *mutex);
 int turn_mutex_init_recursive(turn_mutex *mutex);
 
+int turn_mutex_trylock(const turn_mutex *mutex);
 int turn_mutex_lock(const turn_mutex *mutex);
 int turn_mutex_unlock(const turn_mutex *mutex);
 
@@ -301,6 +302,10 @@ int register_callback_on_ioa_socket(ioa_engine_handle e, ioa_socket_handle s, in
                                     void *ctx, int clean_preexisting);
 int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr *dest_addr, ioa_network_buffer_handle nbh, int ttl,
                                   int tos, int *skip);
+/* Admission is independent of the legacy return/skip and does not imply delivery. */
+int send_data_from_ioa_socket_nbh_with_admission(ioa_socket_handle s, ioa_addr *dest_addr,
+                                                 ioa_network_buffer_handle nbh, int ttl, int tos, int *skip,
+                                                 bool *admitted);
 void close_ioa_socket(ioa_socket_handle s);
 #define IOA_CLOSE_SOCKET(S)                                                                                            \
   do {                                                                                                                 \

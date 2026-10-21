@@ -670,6 +670,12 @@ static void udp_send_stateless_error(dtls_listener_relay_server_type *server, io
   }
   ioa_network_buffer_set_size(nbh, rlen);
 
+  if (method == STUN_METHOD_ALLOCATE && realm) {
+    /* This listener runs on its turnserver's event loop, including the stateless path. */
+    turn_observe_session observation = {0};
+    turn_observe_bind(ts->observation, &observation, realm);
+    turn_observe_result(ts->observation, &observation, err_code);
+  }
   udp_send_message(server, nbh, &(nd->src_addr));
   ioa_network_buffer_delete(server->e, nbh);
 }

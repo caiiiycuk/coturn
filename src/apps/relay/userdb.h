@@ -188,7 +188,8 @@ int get_user_key(int in_oauth, int *out_oauth, uint64_t *oauth_expiration_time, 
 uint8_t *start_user_check(turnserver_id id, turn_credential_type ct, int in_oauth, int *out_oauth, uint8_t *usname,
                           uint8_t *realm, get_username_resume_cb resume, ioa_net_data *in_buffer, uint64_t ctxkey,
                           int *postpone_reply);
-int check_new_allocation_quota(uint8_t *username, int oauth, uint8_t *realm);
+int check_new_allocation_quota(uint8_t *username, int oauth, uint8_t *realm, turn_quota_cause *cause);
+int turn_read_quota_snapshot(const char *name, turn_observe_quota *out);
 void release_allocation_quota(uint8_t *username, int oauth, uint8_t *realm);
 
 /////////// Handle user DB /////////////////

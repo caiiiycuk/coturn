@@ -879,11 +879,17 @@ static void cb_realm_option_apply(char cols[][MY_COL_SZ], const unsigned long *l
   /* columns: realm,opt,value */
   realm_params_t *rp = get_realm(cols[0]);
   if (!strcmp(cols[1], "max-bps")) {
+    lock_realms();
     rp->options.perf_options.max_bps = (band_limit_t)strtoul(cols[2], NULL, 10);
+    unlock_realms();
   } else if (!strcmp(cols[1], "total-quota")) {
+    lock_realms();
     rp->options.perf_options.total_quota = (vint)atoi(cols[2]);
+    unlock_realms();
   } else if (!strcmp(cols[1], "user-quota")) {
+    lock_realms();
     rp->options.perf_options.user_quota = (vint)atoi(cols[2]);
+    unlock_realms();
   } else {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Unknown realm option: %s\n", cols[1]);
   }

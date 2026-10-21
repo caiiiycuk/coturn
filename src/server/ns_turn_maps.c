@@ -1076,6 +1076,10 @@ size_t ur_string_map_size(const ur_string_map *map) {
   return ret;
 }
 
+bool turn_ur_string_map_trylock(const ur_string_map *map) {
+  return ur_string_map_valid(map) && turn_mutex_trylock(&map->mutex) == 0;
+}
+
 bool ur_string_map_lock(const ur_string_map *map) {
   if (ur_string_map_valid(map)) {
     TURN_MUTEX_LOCK((const turn_mutex *)&(map->mutex));

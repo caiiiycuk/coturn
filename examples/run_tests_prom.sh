@@ -227,3 +227,9 @@ assert_prom_metric_nonzero "turn_unauthenticated_401_dropped_responses" "$prom_m
 assert_prom_metric_nonzero "turn_ratelimit_occupied_buckets" "$prom_metrics"
 assert_prom_metric_nonzero "turn_ratelimit_total_buckets" "$prom_metrics"
 stop_turnserver
+
+if command -v python3 >/dev/null 2>&1; then
+  python3 ./scripts/turn_observability.py "$BINDIR" || exit 1
+else
+  echo "SKIP: capacity observability protocol checks require python3"
+fi

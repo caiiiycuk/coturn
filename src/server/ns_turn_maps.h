@@ -280,6 +280,7 @@ size_t ur_string_map_size(const ur_string_map *map);
  * true - success
  * false - failure
  */
+bool turn_ur_string_map_trylock(const ur_string_map *map);
 bool ur_string_map_lock(const ur_string_map *map);
 
 /**
