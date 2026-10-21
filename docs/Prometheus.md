@@ -127,9 +127,11 @@ unique names of at most 763 bytes). Without it, only the final default realm is
 observed. Duplicates are ignored. Invalid lists fail before listeners start.
 Selection is fixed until restart, including across realm-limit reloads.
 
-Other realms are excluded. A configured but nonexistent realm has zero event
-and activity samples, no quota samples and an unready snapshot. Telemetry does
-not create realms or derive labels from client-supplied values.
+Other realms are excluded. A configured realm that the server has not
+referenced yet (for example, before its first request after a restart) has zero
+event and activity samples, `turn_quota_used` 0 and the default realm's limits,
+exactly what the server would create for it. Telemetry does not create realms or
+derive labels from client-supplied values.
 
 | Metric | Type | Labels and meaning |
 |---|---|---|

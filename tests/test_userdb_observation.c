@@ -38,7 +38,16 @@ void tearDown(void) {}
 static void test_two_realms_runtime_limits_and_unknown_lookup(void) {
   turn_observe_quota snapshot = {0};
   const size_t before = ur_string_map_size(realms);
-  TEST_ASSERT_EQUAL(0, turn_read_quota_snapshot("missing", &snapshot));
+  change_total_quota("first", 5);
+  change_user_quota("first", 3);
+  TEST_ASSERT_EQUAL(1, turn_read_quota_snapshot("missing", &snapshot));
+  TEST_ASSERT_TRUE(snapshot.known);
+  TEST_ASSERT_EQUAL_UINT64(0, snapshot.used);
+  TEST_ASSERT_EQUAL_UINT64(5, snapshot.total);
+  TEST_ASSERT_EQUAL_UINT64(3, snapshot.user);
+  change_total_quota("first", 0);
+  change_user_quota("first", 0);
+  snapshot = (turn_observe_quota){0};
   char overlong[STUN_MAX_REALM_SIZE + 2] = {0};
   memset(overlong, 'x', sizeof(overlong) - 1);
   overlong[sizeof(overlong) - 1] = 0;

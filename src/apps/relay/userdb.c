@@ -693,7 +693,7 @@ int turn_read_quota_snapshot(const char *name, turn_observe_quota *out) {
   } else if (ur_string_map_get(realms, key, &value)) {
     rp = (realm_params_t *)value;
   }
-  int result = 0;
+  int result = 1;
   if (rp) {
     /* Both existing locks are try-only; never wait while holding either. */
     if (turn_ur_string_map_trylock(rp->status.alloc_counters)) {
@@ -702,10 +702,15 @@ int turn_read_quota_snapshot(const char *name, turn_observe_quota *out) {
       out->user = rp->options.perf_options.user_quota;
       out->known = true;
       ur_string_map_unlock(rp->status.alloc_counters);
-      result = 1;
     } else {
       result = -1;
     }
+  } else {
+    /* A realm not referenced yet holds no quota and would inherit the default limits in get_realm(). */
+    out->used = 0;
+    out->total = default_realm_params_ptr->options.perf_options.total_quota;
+    out->user = default_realm_params_ptr->options.perf_options.user_quota;
+    out->known = true;
   }
   ur_string_map_unlock(realms);
   return result;

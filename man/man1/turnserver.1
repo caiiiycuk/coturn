@@ -1322,7 +1322,7 @@ and keep fleet clocks NTP\-synced.
 Observe this exact realm for capacity metrics. Repeat for at most 16 distinct
 names, each at most 763 bytes; duplicates are ignored. The default is the server's
 default realm. Coverage is fixed at startup. Nonexistent realms are not created
-by telemetry and have no quota samples. See docs/Prometheus.md for the metrics
+by telemetry and report zero usage with the default realm's limits. See docs/Prometheus.md for the metrics
 contract. The HTTP(S) exporter admits at most eight simultaneous connections
 with a ten-second inactivity timeout; TURN listeners are unaffected.
 .SH ==================================

@@ -53,7 +53,7 @@ typedef struct {
 } turn_observe_snapshot;
 
 typedef struct turn_observe_owner turn_observe_owner;
-/* 1 = existing consistent snapshot; 0 = unknown realm; -1 = busy. */
+/* 1 = consistent snapshot (unreferenced realms report default limits); 0 = invalid name; -1 = busy. */
 typedef int (*turn_observe_quota_reader)(const char *, turn_observe_quota *);
 
 bool turn_observe_add_realm(const char *name);

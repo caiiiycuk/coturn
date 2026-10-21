@@ -420,11 +420,13 @@ def check_freshness_between_scrapes():
 
 
 def check_cardinality_and_unknown():
-    with server(realms=('missing',)) as (_, _, scrape, _):
-        data = samples(scrape())
-        assert len(data) == 30
-        assert not any(name in FAMILIES[:2] for name, _ in data)
-        assert value(data, FAMILIES[-1]) == 0
+    with server(realms=('missing',), extra=('--total-quota=9', '--user-quota=4')) as (_, _, scrape, _):
+        data = wait_for(lambda: (current if value(current := samples(scrape()), FAMILIES[-1]) > 0 else None),
+                        'unreferenced realm kept the snapshot unready')
+        assert len(data) == 33
+        assert value(data, FAMILIES[0], realm='missing') == 0
+        assert value(data, FAMILIES[1], realm='missing', scope='total') == 9
+        assert value(data, FAMILIES[1], realm='missing', scope='user') == 4
     # The existing DB origin map creates these actual server realms, not the observer.
     realms = tuple((str(i) + '"\\' * 381)[:763] for i in range(16))
     for tls in (False, True):
@@ -477,7 +479,7 @@ def check_cardinality_and_unknown():
                 for reader in readers:
                     reader.close()
             wait_for(scrape, 'exporter did not recover after readers disconnected')
-    print('OK: unknown quota absent; HTTP and TLS have 513 series at maximum escaped realm length')
+    print('OK: unreferenced realm reports default limits; HTTP and TLS have 513 series at maximum escaped realm length')
     if os.environ.get('TURN_TEST_SLOW_READER_SOURCE'):
         print('OK: instrumented HTTP/TLS eight-reader admission; exporter recovered after disconnect')
 
