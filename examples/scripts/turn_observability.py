@@ -228,6 +228,29 @@ def check_binding_at_total_quota():
     print('OK: total-quota=1 rejects authenticated Allocate with 486; UDP Binding preserves transaction/mapped address and quota; release permits Allocate')
 
 
+def check_unsupported_anonymous_stun_modes():
+    for flag in ('--no-stun', '--secure-stun', '--no-udp'):
+        with server(extra=(flag,)) as (turn_port, _, scrape, _):
+            wait_for(lambda: value(samples(scrape()), FAMILIES[-1]) > 0, 'snapshot not ready')
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as binding:
+                binding.settimeout(0.3)
+                binding.connect(('127.0.0.1', turn_port))
+                binding.send(make(0x0001, []))
+                try:
+                    response = binding.recv(2048)
+                except (TimeoutError, ConnectionRefusedError):
+                    assert flag != '--secure-stun', 'secure STUN did not return an authentication challenge'
+                else:
+                    typ, attrs = parse(response)
+                    assert typ != 0x0101, flag
+                    if flag == '--secure-stun':
+                        assert typ == 0x0111 and errcode(attrs) == 401
+            current = samples(scrape())
+            assert value(current, FAMILIES[0], realm='observed') == 0
+            assert value(current, FAMILIES[3], realm='observed') == 0
+    print('OK: no-stun/secure-stun/no-udp never provide anonymous UDP Binding or consume quota')
+
+
 def check_final_errors_and_limits():
     with server() as (turn_port, _, scrape, _):
         client = Allocation(turn_port)
@@ -531,6 +554,7 @@ def check_cardinality_and_unknown():
 if __name__ == '__main__':
     check_lifecycle_and_responses()
     check_binding_at_total_quota()
+    check_unsupported_anonymous_stun_modes()
     check_final_errors_and_limits()
     check_stateless_udp_results()
     check_expiry_refresh_and_partial_family()

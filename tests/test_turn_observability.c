@@ -288,6 +288,9 @@ static void test_workers_unknown_realm_and_repeated_collection(void) {
   TEST_ASSERT_EQUAL_UINT64(5, out.realm[0].created);
   turn_observe_collect(&out);
   TEST_ASSERT_EQUAL_UINT64(5, out.realm[0].created);
+  turn_observe_publish(two, 1010);
+  turn_observe_collect(&out);
+  TEST_ASSERT_EQUAL_UINT64(1000, out.timestamp);
   turn_test_quota_result = 0;
   turn_observe_publish(one, 1002);
   turn_observe_collect(&out);
